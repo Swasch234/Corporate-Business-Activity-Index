@@ -1,0 +1,186 @@
+import pandas as pd
+import sqlite3
+
+# ── Stage 1: Load & Store ────────────────────────────────────────────────────
+
+df = pd.read_csv('fred_data.csv')
+df['date'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
+df = df[df['date'] >= '2000-01-01']
+
+conn = sqlite3.connect('activity_index.db')
+cursor = conn.cursor()
+
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS fred_series (
+        date      TEXT NOT NULL,
+        series_id TEXT NOT NULL,
+        value     REAL,
+        PRIMARY KEY (date, series_id)
+    )
+""")
+
+df.to_sql('fred_series', conn, if_exists='replace', index=False)
+print(f"Loaded {len(df)} rows into fred_series")
+conn.commit()
+conn.close()
+
+# ── Stage 2: Resample to monthly & pivot ────────────────────────────────────
+#
+# The five FRED series have incompatible native frequencies:
+#   BAMLH0A0HYM2  → daily
+#   INDPRO        → monthly
+#   BUSLOANS      → monthly
+#   JTSJOL        → monthly
+#   PNFI          → quarterly
+#
+# Pivoting on exact dates and then calling dropna() would keep only the rare
+# rows where all five series share the same timestamp — producing a near-empty
+# table.  Instead we resample everything to month-start frequency in Python
+# before writing the pivot table back to SQLite.
+
+conn = sqlite3.connect('activity_index.db')
+raw = pd.read_sql('SELECT * FROM fred_series', conn)
+conn.close()
+
+raw['date'] = pd.to_datetime(raw['date'])
+
+def to_monthly(group):
+    """Resample a single series to month-start frequency.
+
+    - Daily series  → monthly mean (smooths noise, no look-ahead bias)
+    - Monthly series → value is preserved as-is by resample('MS').mean()
+    - Quarterly series → forward-fill fills the two intervening months
+    """
+    s = group.set_index('date')['value'].sort_index()
+    monthly = s.resample('MS').mean()   # daily→mean; monthly→identity
+    monthly = monthly.ffill()           # quarterly→fill gaps forward
+    return monthly
+
+series_monthly = {
+    sid: to_monthly(grp)
+    for sid, grp in raw.groupby('series_id')
+}
+
+wide = pd.DataFrame(series_monthly)
+wide.index.name = 'date'
+wide = wide[wide.index >= '2000-01-01'].sort_index()
+
+wide = wide.rename(columns={
+    'INDPRO':        'indpro',
+    'BUSLOANS':      'busloans',
+    'JTSJOL':        'job_openings',
+    'BAMLH0A0HYM2':  'credit_spread',
+    'PNFI':          'bus_investment',
+})
+
+# Write the cleaned pivot back to the database
+conn = sqlite3.connect('activity_index.db')
+cursor = conn.cursor()
+cursor.execute("DROP TABLE IF EXISTS activity_index_input")
+conn.commit()
+
+wide_reset = wide.reset_index()
+wide_reset['date'] = wide_reset['date'].dt.strftime('%Y-%m-%d')
+wide_reset.to_sql('activity_index_input', conn, if_exists='replace', index=False)
+
+conn.commit()
+conn.close()
+
+print("\n5-row preview of activity_index_input:")
+with sqlite3.connect('activity_index.db') as conn:
+    preview = pd.read_sql(
+        "SELECT * FROM activity_index_input WHERE indpro IS NOT NULL LIMIT 5",
+        conn
+    )
+    print(preview)
+
+# ── Stage 3: PCA & Visualization ─────────────────────────────────────────────
+
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+
+conn = sqlite3.connect('activity_index.db')
+df = pd.read_sql('SELECT * FROM activity_index_input ORDER BY date', conn)
+conn.close()
+
+df['date'] = pd.to_datetime(df['date'])
+df = df.set_index('date').dropna()
+
+if df.empty:
+    raise ValueError(
+        "No rows remain after dropna(). Check that all five FRED series "
+        "have overlapping date coverage in fred_data.csv."
+    )
+
+date_min, date_max = df.index.min().strftime('%Y-%m'), df.index.max().strftime('%Y-%m')
+print(f"\nPCA sample: {len(df)} monthly observations ({date_min} → {date_max})")
+
+# Invert credit spread so higher = better business conditions
+df['credit_spread'] = -df['credit_spread']
+
+# Standardize all series
+scaler = StandardScaler()
+scaled = scaler.fit_transform(df)
+
+# Extract first principal component as composite index
+pca = PCA(n_components=1)
+index_raw = pca.fit_transform(scaled).flatten()
+
+variance_explained = pca.explained_variance_ratio_[0]
+print(f"Variance explained by PC1: {variance_explained:.1%}")
+
+# Rescale to 0–100 for interpretability
+index_min, index_max = index_raw.min(), index_raw.max()
+df['activity_index'] = 100 * (index_raw - index_min) / (index_max - index_min)
+
+print("\nActivity index (tail):")
+print(df['activity_index'].tail(10).round(1))
+
+# ── Chart ─────────────────────────────────────────────────────────────────────
+
+fig, ax = plt.subplots(figsize=(12, 5))
+ax.plot(df.index, df['activity_index'], color='#0F5F6E', linewidth=2)
+ax.fill_between(df.index, df['activity_index'], alpha=0.15, color='#0F5F6E')
+
+# NBER recession bands — only shade those that overlap the data window
+recessions = [
+    ('2001-03', '2001-11'),
+    ('2007-12', '2009-06'),
+    ('2020-02', '2020-04'),
+]
+for start, end in recessions:
+    start_dt = pd.to_datetime(start)
+    end_dt   = pd.to_datetime(end)
+    if end_dt >= df.index.min() and start_dt <= df.index.max():
+        ax.axvspan(start_dt, end_dt, alpha=0.12, color='gray', label='_nolegend_')
+
+# Dynamic x-axis that fits whatever date window the data covers
+ax.set_xlim(df.index.min(), df.index.max())
+total_months = (df.index.max().year - df.index.min().year) * 12 + \
+               (df.index.max().month - df.index.min().month)
+locator_interval = max(1, total_months // 12)   # aim for ~12 x-axis ticks
+ax.xaxis.set_major_locator(mdates.MonthLocator(interval=locator_interval))
+ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
+plt.xticks(rotation=30, ha='right')
+
+ax.set_title(
+    f'Corporate Business Activity Index  ({date_min} – {date_max})',
+    fontsize=14, fontweight='bold', color='#0F5F6E'
+)
+ax.set_ylabel('Index (0 = weakest, 100 = strongest)', fontsize=11)
+ax.grid(axis='y', linestyle='--', alpha=0.4)
+
+# Annotate variance explained
+ax.text(
+    0.01, 0.97,
+    f'PC1 explains {variance_explained:.0%} of variance across 5 indicators',
+    transform=ax.transAxes, fontsize=9, va='top', color='#555555'
+)
+
+plt.tight_layout()
+plt.savefig('activity_index.png', dpi=150)
+plt.show()
+print("\nDone — activity_index.png saved.")
