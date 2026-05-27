@@ -6,18 +6,19 @@ A data pipeline and composite economic indicator that combines multiple FRED mac
 
 ## Overview
 
-This project fetches macroeconomic data from the Federal Reserve Economic Data (FRED) database, stores it in a local SQLite database, and applies PCA to distill five economic indicators into one composite index scaled from 0 (weakest conditions) to 100 (strongest conditions). The result is exported as a chart with NBER recession shading for context.
+This project reads macroeconomic data from a FRED CSV export, stores it in a local SQLite database, resamples all series to a common monthly frequency, and applies PCA to distill five economic indicators into one composite index scaled from 0 (weakest conditions) to 100 (strongest conditions). The result is exported as a publication-ready chart with NBER recession shading and a variance-explained annotation.
 
 ---
 
 ## Features
 
 - Ingests and cleans FRED data from a CSV source
-- Stores raw and pivoted data in a local SQLite database
-- Inverts the credit spread so all indicators point in the same direction
+- Stores raw data in a local SQLite database
+- Resamples all series to a common monthly frequency before pivoting, correctly handling daily, monthly, and quarterly source data
+- Inverts the credit spread so all five indicators point in the same direction
 - Standardizes all series before applying PCA
 - Outputs a normalized 0–100 composite activity index
-- Generates a publication-ready chart with recession bands annotated
+- Generates a chart with a dynamic x-axis, variance-explained label, and recession bands that auto-adjust to the data window
 
 ---
 
@@ -45,15 +46,15 @@ The project expects a CSV file named `fred_data.csv` in the working directory wi
 
 ### FRED Series Used
 
-| Series ID        | Description                                  | Native Frequency |
-|------------------|----------------------------------------------|------------------|
-| `INDPRO`         | Industrial Production Index                  | Monthly          |
-| `BUSLOANS`       | Commercial & Industrial Loans                | Monthly          |
-| `JTSJOL`         | Job Openings (JOLTS)                         | Monthly          |
-| `BAMLH0A0HYM2`   | High-Yield Credit Spread (inverted)          | Daily            |
-| `PNFI`           | Private Nonresidential Fixed Investment      | Quarterly        |
+| Series ID       | Description                             | Native Frequency |
+|-----------------|-----------------------------------------|------------------|
+| `INDPRO`        | Industrial Production Index             | Monthly          |
+| `BUSLOANS`      | Commercial & Industrial Loans           | Monthly          |
+| `JTSJOL`        | Job Openings (JOLTS)                    | Monthly          |
+| `BAMLH0A0HYM2`  | High-Yield Credit Spread (inverted)     | Daily            |
+| `PNFI`          | Private Nonresidential Fixed Investment | Quarterly        |
 
-> Data is filtered to observations from **January 1, 2000 onward**. However, see the [Known Issue](#known-issue-frequency-mismatch-causes-data-gap) below — without frequency alignment, the composite index will contain very few usable observations despite this date filter.
+> The composite index can only be computed for months where all five series have coverage. The effective date range of the output is therefore determined by whichever series has the shortest history in your `fred_data.csv`. With the current CSV, the index runs from **April 2023 to October 2025** (31 months), limited by the credit spread data. To extend the window back to 2000, re-pull `BAMLH0A0HYM2` from FRED for the full history and rebuild the CSV.
 
 ---
 
@@ -68,79 +69,47 @@ python Navan_Project1.py
 The script executes three stages in sequence:
 
 **Stage 1 — Load & Store**
-Reads `fred_data.csv`, parses dates, and writes the data into a SQLite database (`activity_index.db`) with a table called `fred_series`.
+Reads `fred_data.csv`, parses and filters dates to 2000-01-01 onward, and writes all observations into a SQLite database (`activity_index.db`) in a table called `fred_series`.
 
-**Stage 2 — Pivot**
-Creates an `activity_index_input` table in the same database by pivoting the five FRED series into wide format, grouped by exact date.
+**Stage 2 — Resample & Pivot**
+Reads `fred_series` back into Python and resamples each series individually to month-start frequency using a `to_monthly()` helper before joining them into a wide-format table. The resampling rules differ by native frequency:
+
+| Native frequency | Resampling treatment                                      |
+|------------------|-----------------------------------------------------------|
+| Daily            | Monthly mean of all observations in the calendar month   |
+| Monthly          | Preserved as-is (monthly mean of one value is itself)    |
+| Quarterly        | Monthly mean, then forward-filled to fill intervening months |
+
+The resulting wide table is written back to `activity_index.db` as `activity_index_input`.
 
 **Stage 3 — PCA & Visualization**
-Standardizes the five indicators, extracts the first principal component, rescales it to 0–100, and saves the chart as `activity_index.png`.
+Reads `activity_index_input`, drops any months with missing values, standardizes the five indicators, extracts the first principal component, rescales it to 0–100, and saves the chart as `activity_index.png`. The chart x-axis and title update dynamically to match the actual data window.
 
 ---
 
 ## Outputs
 
-| File                  | Description                                       |
-|-----------------------|---------------------------------------------------|
-| `activity_index.db`   | SQLite database with raw and pivoted FRED data    |
-| `activity_index.png`  | Time-series chart of the composite index          |
+| File                | Description                                    |
+|---------------------|------------------------------------------------|
+| `activity_index.db` | SQLite database with raw and pivoted FRED data |
+| `activity_index.png`| Time-series chart of the composite index       |
 
-The console will also print:
-- Row count loaded into the database
-- A 5-row preview of the pivoted input table
-- The variance explained by the first principal component
-- The full activity index series
-
----
-
-## Known Issue: Frequency Mismatch Causes Data Gap
-
-**The chart produced by the current script will appear nearly blank for 2000–2023**, with index values only populating in the most recent window. This is a data alignment problem, not a code error.
-
-**Root cause:** The five FRED series are published at different frequencies — `PNFI` is quarterly, `BAMLH0A0HYM2` is daily, and the remaining three are monthly. The pivot in Stage 2 groups rows by exact date string. After pivoting, `dropna()` in the PCA stage drops every row that is missing any one series. Because these series rarely share an identical timestamp, the vast majority of dates are eliminated.
-
-**Recommended fix:** Resample all series to a common frequency (monthly recommended) before pivoting. Replace the Stage 2 pivot logic with something like the following in Python:
-
-```python
-import pandas as pd
-import sqlite3
-
-conn = sqlite3.connect('activity_index.db')
-df = pd.read_sql('SELECT * FROM fred_series', conn)
-conn.close()
-
-df['date'] = pd.to_datetime(df['date'])
-
-# Resample each series to month-end frequency
-df_monthly = (
-    df.groupby('series_id')
-    .apply(lambda g: g.set_index('date')['value'].resample('ME').last())
-    .reset_index()
-)
-df_monthly.columns = ['series_id', 'date', 'value']
-
-# Pivot to wide format
-pivot = df_monthly.pivot(index='date', columns='series_id', values='value')
-pivot = pivot.rename(columns={
-    'INDPRO':        'indpro',
-    'BUSLOANS':      'busloans',
-    'JTSJOL':        'job_openings',
-    'BAMLH0A0HYM2':  'credit_spread',
-    'PNFI':          'bus_investment'
-})
-pivot = pivot[pivot.index >= '2000-01-01'].sort_index()
-```
-
-Write this resampled pivot table back to `activity_index_input` before running Stage 3. After this fix, the chart should display a continuous index from 2001 onward (JOLTS data begins December 2000; prior months will still be dropped by `dropna()`).
+The console also prints:
+- Row count loaded into `fred_series`
+- A 5-row preview of `activity_index_input`
+- The number of monthly observations used in PCA and their date range
+- The variance explained by PC1
+- The 10 most recent index values
 
 ---
 
 ## Methodology
 
-1. **Inversion** — The high-yield credit spread (`BAMLH0A0HYM2`) is multiplied by −1 so that all five indicators are positively correlated with strong business conditions.
-2. **Standardization** — Each series is z-scored using `StandardScaler` to remove scale differences before PCA.
-3. **PCA** — The first principal component (PC1) captures the shared variance across all five indicators and serves as the composite index.
-4. **Rescaling** — PC1 scores are min-max normalized to a 0–100 range for interpretability.
+1. **Frequency alignment** — All five series are resampled to month-start frequency before any joining occurs. This ensures that `dropna()` only removes months with genuinely missing data rather than discarding valid observations due to timestamp mismatches between daily, monthly, and quarterly series.
+2. **Inversion** — The high-yield credit spread (`BAMLH0A0HYM2`) is multiplied by −1 so that all five indicators are positively correlated with strong business conditions.
+3. **Standardization** — Each series is z-scored using `StandardScaler` to remove scale differences before PCA.
+4. **PCA** — The first principal component (PC1) captures the shared variance across all five indicators and serves as the composite index. With the current data, PC1 explains approximately **63% of total variance**.
+5. **Rescaling** — PC1 scores are min-max normalized to a 0–100 range for interpretability.
 
 ---
 
@@ -158,7 +127,8 @@ Write this resampled pivot table back to `activity_index_input` before running S
 
 ## Notes
 
-- **Coverage start:** The effective start date for the composite index is approximately **December 2000**, when JOLTS job openings data (`JTSJOL`) begins. Dates prior to that will be dropped by `dropna()` regardless of coverage in the other four series.
-- **Relative index:** The 0–100 scale is relative to the sample period, not an external benchmark. A reading of 100 means the strongest conditions observed within the data window, not an absolute maximum.
-- **NBER recession shading:** Recession bands are hardcoded for the 2001, 2007–2009, and 2020 downturns. Update the `recessions` list in the script to add any subsequent NBER-designated recession periods.
-- **Quarterly series interpolation:** After monthly resampling, `PNFI` values will repeat within each quarter (last-observation-carried-forward via `.last()`). This is a reasonable approximation but slightly smooths the quarterly signal.
+- **Extending the date range:** The current `fred_data.csv` contains `BAMLH0A0HYM2` data only from April 2023 onward, which constrains the composite index to that window. All other series have coverage back to January 2000. Pulling the full credit spread history from FRED and appending it to the CSV is the only change needed to produce a 25-year index.
+- **JOLTS floor:** Even with a complete credit spread history, the index cannot start before December 2000 because `JTSJOL` (JOLTS) was first published then.
+- **Relative scale:** The 0–100 score is relative to the sample period in the CSV, not an external benchmark. A reading of 100 represents the strongest conditions observed within the data window, not an absolute maximum.
+- **Quarterly forward-fill:** `PNFI` values are carried forward to fill the two months between each quarterly release. This is a standard approximation but slightly smooths the quarterly signal.
+- **NBER recession shading:** Bands are hardcoded for the 2001, 2007–2009, and 2020 recessions. The chart only renders a band if it overlaps the actual data window, so no phantom shading appears on an empty axis. Update the `recessions` list in the script to add any future NBER-designated periods.
