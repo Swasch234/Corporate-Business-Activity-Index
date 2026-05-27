@@ -37,23 +37,23 @@ SQLite3 is included in Python's standard library — no additional installation 
 
 The project expects a CSV file named `fred_data.csv` in the working directory with the following columns:
 
-| Column      | Description                          |
-|-------------|--------------------------------------|
+| Column      | Description                             |
+|-------------|-----------------------------------------|
 | `date`      | Observation date (any parseable format) |
-| `series_id` | FRED series identifier               |
-| `value`     | Numeric observation value            |
+| `series_id` | FRED series identifier                  |
+| `value`     | Numeric observation value               |
 
 ### FRED Series Used
 
-| Series ID       | Description                         |
-|-----------------|-------------------------------------|
-| `INDPRO`        | Industrial Production Index         |
-| `BUSLOANS`      | Commercial & Industrial Loans       |
-| `JTSJOL`        | Job Openings (JOLTS)                |
-| `BAMLH0A0HYM2`  | High-Yield Credit Spread (inverted) |
-| `PNFI`          | Private Nonresidential Fixed Investment |
+| Series ID        | Description                                  | Native Frequency |
+|------------------|----------------------------------------------|------------------|
+| `INDPRO`         | Industrial Production Index                  | Monthly          |
+| `BUSLOANS`       | Commercial & Industrial Loans                | Monthly          |
+| `JTSJOL`         | Job Openings (JOLTS)                         | Monthly          |
+| `BAMLH0A0HYM2`   | High-Yield Credit Spread (inverted)          | Daily            |
+| `PNFI`           | Private Nonresidential Fixed Investment      | Quarterly        |
 
-> Data is filtered to observations from **January 1, 2000 onward**.
+> Data is filtered to observations from **January 1, 2000 onward**. However, see the [Known Issue](#known-issue-frequency-mismatch-causes-data-gap) below — without frequency alignment, the composite index will contain very few usable observations despite this date filter.
 
 ---
 
@@ -71,7 +71,7 @@ The script executes three stages in sequence:
 Reads `fred_data.csv`, parses dates, and writes the data into a SQLite database (`activity_index.db`) with a table called `fred_series`.
 
 **Stage 2 — Pivot**
-Creates an `activity_index_input` table in the same database by pivoting the five FRED series into wide format, grouped by date.
+Creates an `activity_index_input` table in the same database by pivoting the five FRED series into wide format, grouped by exact date.
 
 **Stage 3 — PCA & Visualization**
 Standardizes the five indicators, extracts the first principal component, rescales it to 0–100, and saves the chart as `activity_index.png`.
@@ -83,13 +83,55 @@ Standardizes the five indicators, extracts the first principal component, rescal
 | File                  | Description                                       |
 |-----------------------|---------------------------------------------------|
 | `activity_index.db`   | SQLite database with raw and pivoted FRED data    |
-| `activity_index.png`  | Time-series chart of the composite index (2000–present) |
+| `activity_index.png`  | Time-series chart of the composite index          |
 
 The console will also print:
 - Row count loaded into the database
 - A 5-row preview of the pivoted input table
 - The variance explained by the first principal component
 - The full activity index series
+
+---
+
+## Known Issue: Frequency Mismatch Causes Data Gap
+
+**The chart produced by the current script will appear nearly blank for 2000–2023**, with index values only populating in the most recent window. This is a data alignment problem, not a code error.
+
+**Root cause:** The five FRED series are published at different frequencies — `PNFI` is quarterly, `BAMLH0A0HYM2` is daily, and the remaining three are monthly. The pivot in Stage 2 groups rows by exact date string. After pivoting, `dropna()` in the PCA stage drops every row that is missing any one series. Because these series rarely share an identical timestamp, the vast majority of dates are eliminated.
+
+**Recommended fix:** Resample all series to a common frequency (monthly recommended) before pivoting. Replace the Stage 2 pivot logic with something like the following in Python:
+
+```python
+import pandas as pd
+import sqlite3
+
+conn = sqlite3.connect('activity_index.db')
+df = pd.read_sql('SELECT * FROM fred_series', conn)
+conn.close()
+
+df['date'] = pd.to_datetime(df['date'])
+
+# Resample each series to month-end frequency
+df_monthly = (
+    df.groupby('series_id')
+    .apply(lambda g: g.set_index('date')['value'].resample('ME').last())
+    .reset_index()
+)
+df_monthly.columns = ['series_id', 'date', 'value']
+
+# Pivot to wide format
+pivot = df_monthly.pivot(index='date', columns='series_id', values='value')
+pivot = pivot.rename(columns={
+    'INDPRO':        'indpro',
+    'BUSLOANS':      'busloans',
+    'JTSJOL':        'job_openings',
+    'BAMLH0A0HYM2':  'credit_spread',
+    'PNFI':          'bus_investment'
+})
+pivot = pivot[pivot.index >= '2000-01-01'].sort_index()
+```
+
+Write this resampled pivot table back to `activity_index_input` before running Stage 3. After this fix, the chart should display a continuous index from 2001 onward (JOLTS data begins December 2000; prior months will still be dropped by `dropna()`).
 
 ---
 
@@ -116,6 +158,7 @@ The console will also print:
 
 ## Notes
 
-- Rows with any missing values across the five series are dropped before PCA (`dropna()`). Ensure your input data has reasonable coverage across all five series to avoid significant data loss.
-- The index is **relative**, not absolute — it reflects conditions within the sample period, not against an external benchmark.
-- NBER recession dates are hardcoded for 2001, 2007–2009, and 2020. Update the `recessions` list in the script to extend coverage.
+- **Coverage start:** The effective start date for the composite index is approximately **December 2000**, when JOLTS job openings data (`JTSJOL`) begins. Dates prior to that will be dropped by `dropna()` regardless of coverage in the other four series.
+- **Relative index:** The 0–100 scale is relative to the sample period, not an external benchmark. A reading of 100 means the strongest conditions observed within the data window, not an absolute maximum.
+- **NBER recession shading:** Recession bands are hardcoded for the 2001, 2007–2009, and 2020 downturns. Update the `recessions` list in the script to add any subsequent NBER-designated recession periods.
+- **Quarterly series interpolation:** After monthly resampling, `PNFI` values will repeat within each quarter (last-observation-carried-forward via `.last()`). This is a reasonable approximation but slightly smooths the quarterly signal.
